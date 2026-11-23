@@ -314,3 +314,93 @@ fn delete_keyspace_1() -> crate::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn sync_on_commit_single_writes() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+
+    let db = Database::builder(folder.path()).open()?;
+    let tree = db.keyspace("default", || {
+        KeyspaceCreateOptions::default().sync_on_commit(true)
+    })?;
+
+    assert_eq!(0, db.supervisor.journal.durable_seqno());
+
+    tree.insert("a", "a")?;
+    let durable_after_insert = db.supervisor.journal.durable_seqno();
+    assert!(
+        durable_after_insert >= 1,
+        "insert should be durable before returning, durable_seqno={durable_after_insert}",
+    );
+
+    tree.remove("a")?;
+    assert!(db.supervisor.journal.durable_seqno() > durable_after_insert);
+
+    Ok(())
+}
+
+#[test]
+fn sync_on_commit_batch() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+
+    let db = Database::builder(folder.path())
+        .sync_on_commit(true)
+        .open()?;
+    let tree = db.keyspace("default", KeyspaceCreateOptions::default)?;
+
+    assert_eq!(0, db.supervisor.journal.durable_seqno());
+
+    let mut batch = db.batch();
+    batch.insert(&tree, "a", "a");
+    batch.insert(&tree, "b", "b");
+    batch.commit()?;
+
+    assert!(
+        db.supervisor.journal.durable_seqno() >= 1,
+        "batch should be durable before commit returns",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn sync_on_commit_manual_journal_persist() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+
+    // Even with manual journal persist, sync_on_commit must guarantee
+    // acknowledged writes are durable
+    let db = Database::builder(folder.path())
+        .manual_journal_persist(true)
+        .sync_on_commit(true)
+        .open()?;
+    let tree = db.keyspace("default", KeyspaceCreateOptions::default)?;
+
+    let mut batch = db.batch();
+    batch.insert(&tree, "a", "a");
+    batch.commit()?;
+
+    assert!(
+        db.supervisor.journal.durable_seqno() >= 1,
+        "batch should be durable before commit returns",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn sync_on_commit_disabled_by_default() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+
+    let db = Database::builder(folder.path()).open()?;
+    let tree = db.keyspace("default", KeyspaceCreateOptions::default)?;
+
+    tree.insert("a", "a")?;
+
+    assert_eq!(
+        0,
+        db.supervisor.journal.durable_seqno(),
+        "writes should not be fsynced per commit by default",
+    );
+
+    Ok(())
+}

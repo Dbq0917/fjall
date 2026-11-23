@@ -13,6 +13,10 @@ use std::{
     hash::Hasher,
     io::{BufWriter, Seek, Write},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 // TODO: this should be a database configuration
@@ -28,6 +32,19 @@ pub struct Writer {
 
     compression: CompressionType,
     compression_threshold: usize,
+
+    /// Highest seqno written to the journal.
+    ///
+    /// NOTE: Seqnos are allocated while the journal mutex is held, so writes
+    /// arrive in strictly increasing seqno order.
+    last_seqno: Option<SeqNo>,
+
+    /// Next seqno that is not known to be durably persisted yet
+    /// (= highest fsynced seqno + 1).
+    ///
+    /// Shared with the [`crate::journal::Journal`] that owns this writer, and
+    /// carried over to the next writer when the journal is rotated.
+    durable_seqno: Arc<AtomicU64>,
 }
 
 /// The persist mode allows setting the durability guarantee of previous writes
@@ -61,6 +78,40 @@ impl Writer {
 
     pub fn len(&self) -> crate::Result<u64> {
         Ok(self.file.get_ref().metadata()?.len())
+    }
+
+    /// Returns the highest seqno written to the journal.
+    pub(crate) fn last_seqno(&self) -> Option<SeqNo> {
+        self.last_seqno
+    }
+
+    /// Flushes the IO buffer to the operating system, without syncing.
+    pub(crate) fn flush_buffer(&mut self) -> std::io::Result<()> {
+        if self.is_buffer_dirty {
+            self.file.flush().inspect_err(|e| {
+                log::error!(
+                    "Failed to flush journal IO buffers at {}: {e:?}",
+                    self.path.display(),
+                );
+            })?;
+            self.is_buffer_dirty = false;
+        }
+
+        Ok(())
+    }
+
+    /// Returns a cloned file handle of the journal file that can be used to
+    /// sync the file without holding the journal lock.
+    pub(crate) fn sync_handle(&self) -> std::io::Result<File> {
+        self.file.get_ref().try_clone()
+    }
+
+    /// Marks all writes up to the current [`Writer::last_seqno`] as durably persisted.
+    fn mark_durable(&self) {
+        if let Some(last_seqno) = self.last_seqno {
+            self.durable_seqno
+                .fetch_max(last_seqno + 1, Ordering::AcqRel);
+        }
     }
 
     pub fn rotate(&mut self) -> crate::Result<(PathBuf, PathBuf)> {
@@ -112,7 +163,8 @@ impl Writer {
 
         let comp = self.compression;
         let compt = self.compression_threshold;
-        *self = Self::create_new(new_path.clone())?;
+        let durable_seqno = self.durable_seqno.clone();
+        *self = Self::create_new(new_path.clone(), durable_seqno)?;
         self.set_compression(comp, compt);
 
         // IMPORTANT: fsync folder on Unix
@@ -121,7 +173,10 @@ impl Writer {
         Ok((prev_path, new_path))
     }
 
-    pub fn create_new<P: Into<PathBuf>>(path: P) -> crate::Result<Self> {
+    pub(crate) fn create_new<P: Into<PathBuf>>(
+        path: P,
+        durable_seqno: Arc<AtomicU64>,
+    ) -> crate::Result<Self> {
         let path = path.into();
 
         let file = File::create_new(&path).inspect_err(|e| {
@@ -146,10 +201,15 @@ impl Writer {
             is_buffer_dirty: false,
             compression: CompressionType::None,
             compression_threshold: 0,
+            last_seqno: None,
+            durable_seqno,
         })
     }
 
-    pub fn from_file<P: AsRef<Path>>(path: P) -> crate::Result<Self> {
+    pub(crate) fn from_file<P: AsRef<Path>>(
+        path: P,
+        durable_seqno: Arc<AtomicU64>,
+    ) -> crate::Result<Self> {
         let path = path.as_ref();
 
         if !path.try_exists()? {
@@ -179,6 +239,8 @@ impl Writer {
                 is_buffer_dirty: false,
                 compression: CompressionType::None,
                 compression_threshold: 0,
+                last_seqno: None,
+                durable_seqno,
             });
         }
 
@@ -196,6 +258,8 @@ impl Writer {
             is_buffer_dirty: false,
             compression: CompressionType::None,
             compression_threshold: 0,
+            last_seqno: None,
+            durable_seqno,
         })
     }
 
@@ -206,15 +270,7 @@ impl Writer {
             self.path.display(),
         );
 
-        if self.is_buffer_dirty {
-            self.file.flush().inspect_err(|e| {
-                log::error!(
-                    "Failed to flush journal IO buffers at {}: {e:?}",
-                    self.path.display(),
-                );
-            })?;
-            self.is_buffer_dirty = false;
-        }
+        self.flush_buffer()?;
 
         match mode {
             PersistMode::SyncAll => self.file.get_mut().sync_all().inspect_err(|e| {
@@ -231,6 +287,11 @@ impl Writer {
             }),
             PersistMode::Buffer => Ok(()),
         }
+        .inspect(|()| {
+            if mode != PersistMode::Buffer {
+                self.mark_durable();
+            }
+        })
     }
 
     /// Writes a batch start marker to the journal
@@ -264,6 +325,7 @@ impl Writer {
         seqno: u64,
     ) -> crate::Result<usize> {
         self.is_buffer_dirty = true;
+        self.last_seqno = Some(self.last_seqno.map_or(seqno, |last| last.max(seqno)));
 
         let mut hasher = xxhash_rust::xxh3::Xxh3::default();
         let mut byte_count = 0;
@@ -303,6 +365,7 @@ impl Writer {
         seqno: SeqNo,
     ) -> crate::Result<usize> {
         self.is_buffer_dirty = true;
+        self.last_seqno = Some(self.last_seqno.map_or(seqno, |last| last.max(seqno)));
 
         let mut hasher = xxhash_rust::xxh3::Xxh3::default();
         let mut byte_count = 0;
@@ -334,6 +397,7 @@ impl Writer {
         }
 
         self.is_buffer_dirty = true;
+        self.last_seqno = Some(self.last_seqno.map_or(seqno, |last| last.max(seqno)));
 
         self.buf.clear();
 

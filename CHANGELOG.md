@@ -1,3 +1,7 @@
+# Unreleased
+
+- [feat] Added `sync_on_commit` option (database & keyspace level): commits only return after their journal entries are durably persisted, using group commit to amortize fsyncs across concurrent writers
+
 # 3.1.0
 
 - [feat] Implemented support for compaction filters (custom logic during compactions)

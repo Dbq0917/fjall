@@ -68,6 +68,27 @@ impl<O: Openable> Builder<O> {
         self
     }
 
+    /// If `true`, write batches, transactions and single-keyspace writes only
+    /// return after their journal entries have been durably persisted to disk
+    /// (fsync), so acknowledged writes survive an OS crash or power loss.
+    ///
+    /// Concurrent commits are grouped into a single fsync (group commit), so
+    /// the sync cost is amortized across writers instead of syncing every
+    /// individual write.
+    ///
+    /// Default = false
+    ///
+    /// # Note
+    ///
+    /// This also applies when `manual_journal_persist` is enabled: the
+    /// per-write flush to the OS stays manual, but commits still wait for
+    /// the group commit sync before returning.
+    #[must_use]
+    pub fn sync_on_commit(mut self, flag: bool) -> Self {
+        self.inner.sync_on_commit = flag;
+        self
+    }
+
     /// Disables write stalls & halts.
     ///
     /// Only used for deterministic testing, where flushes & compactions are run manually,

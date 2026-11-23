@@ -284,6 +284,164 @@ fn journal_truncation_corrupt_bytes() -> crate::Result<()> {
 }
 
 #[test]
+#[expect(clippy::redundant_clone)]
+fn journal_group_commit_sync() -> crate::Result<()> {
+    let dir1 = tempdir()?;
+    let db = crate::Database::builder(&dir1).open()?;
+    let keyspace = db.keyspace("default", Default::default)?;
+
+    let dir2 = tempdir()?;
+    let path = dir2.path().join("0.jnl");
+
+    let journal = Journal::create_new(&path)?;
+    assert_eq!(0, journal.durable_seqno());
+
+    for seqno in 0..5 {
+        {
+            let mut writer = journal.get_writer()?;
+            writer.write_batch(
+                [BatchItem::new(
+                    keyspace.clone(),
+                    *b"a",
+                    *b"a",
+                    ValueType::Value,
+                )]
+                .iter(),
+                1,
+                seqno,
+            )?;
+        }
+
+        journal.sync_up_to(seqno)?;
+
+        assert_eq!(seqno + 1, journal.durable_seqno());
+    }
+
+    Ok(())
+}
+
+#[test]
+#[expect(clippy::redundant_clone)]
+fn journal_group_commit_rotation() -> crate::Result<()> {
+    let dir1 = tempdir()?;
+    let db = crate::Database::builder(&dir1).open()?;
+    let keyspace = db.keyspace("default", Default::default)?;
+
+    let dir2 = tempdir()?;
+    let path = dir2.path().join("0.jnl");
+
+    let journal = Journal::create_new(&path)?;
+
+    {
+        let mut writer = journal.get_writer()?;
+        writer.write_batch(
+            [BatchItem::new(
+                keyspace.clone(),
+                *b"a",
+                *b"a",
+                ValueType::Value,
+            )]
+            .iter(),
+            1,
+            0,
+        )?;
+
+        // Rotation fsyncs the previous journal, so the write is durable now
+        writer.rotate()?;
+    }
+
+    assert_eq!(1, journal.durable_seqno());
+
+    {
+        let mut writer = journal.get_writer()?;
+        writer.write_batch(
+            [BatchItem::new(
+                keyspace.clone(),
+                *b"b",
+                *b"b",
+                ValueType::Value,
+            )]
+            .iter(),
+            1,
+            1,
+        )?;
+    }
+
+    journal.sync_up_to(1)?;
+
+    assert_eq!(2, journal.durable_seqno());
+
+    Ok(())
+}
+
+#[test]
+#[expect(clippy::redundant_clone)]
+fn journal_group_commit_concurrent() -> crate::Result<()> {
+    let dir1 = tempdir()?;
+    let db = crate::Database::builder(&dir1).open()?;
+    let keyspace = db.keyspace("default", Default::default)?;
+
+    let dir2 = tempdir()?;
+    let path = dir2.path().join("0.jnl");
+
+    let journal = std::sync::Arc::new(Journal::create_new(&path)?);
+
+    const THREADS: u64 = 4;
+    const BATCHES_PER_THREAD: u64 = 25;
+
+    let seqno_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let mut handles = Vec::new();
+
+    for _ in 0..THREADS {
+        let journal = journal.clone();
+        let keyspace = keyspace.clone();
+        let seqno_counter = seqno_counter.clone();
+
+        handles.push(std::thread::spawn(move || -> crate::Result<()> {
+            for _ in 0..BATCHES_PER_THREAD {
+                // NOTE: Seqnos are allocated while holding the journal lock,
+                // mirroring the production write paths
+                let seqno = {
+                    let mut writer = journal.get_writer()?;
+                    let seqno = seqno_counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    writer.write_batch(
+                        [BatchItem::new(
+                            keyspace.clone(),
+                            *b"a",
+                            *b"a",
+                            ValueType::Value,
+                        )]
+                        .iter(),
+                        1,
+                        seqno,
+                    )?;
+                    seqno
+                };
+
+                journal.sync_up_to(seqno)?;
+
+                assert!(journal.durable_seqno() > seqno);
+            }
+
+            Ok(())
+        }));
+    }
+
+    for handle in handles {
+        handle.join().expect("thread should not panic")?;
+    }
+
+    assert_eq!(
+        THREADS * BATCHES_PER_THREAD,
+        journal.durable_seqno(),
+        "all writes should be durable",
+    );
+
+    Ok(())
+}
+
+#[test]
 #[expect(clippy::unwrap_used, clippy::redundant_clone)]
 fn journal_truncation_repeating_start_marker() -> crate::Result<()> {
     let dir1 = tempdir()?;

@@ -72,6 +72,10 @@ pub struct CreateOptions {
 
     pub(crate) manual_journal_persist: bool,
 
+    /// When `true`, writes only return after the journal entry has been
+    /// durably persisted to disk (group commit).
+    pub(crate) sync_on_commit: bool,
+
     #[doc(hidden)]
     pub compaction_strategy: Arc<dyn lsm_tree::compaction::CompactionStrategy + Send + Sync>,
 
@@ -87,6 +91,8 @@ impl Default for CreateOptions {
 
         Self {
             manual_journal_persist: false,
+
+            sync_on_commit: false,
 
             max_memtable_size: /* 64 MiB */ 64 * 1_024 * 1_024,
 
@@ -337,6 +343,11 @@ impl CreateOptions {
             .expect("should exist")
             == [1];
 
+        // NOTE: Did not exist before v3.2, so fall back to `false` for older keyspaces
+        let sync_on_commit = meta_keyspace
+            .get_kv_for_config(keyspace_id, "sync_on_commit")?
+            .is_some_and(|v| v == [1]);
+
         let max_memtable_size = meta_keyspace
             .get_kv_for_config(keyspace_id, "max_memtable_size")?
             .expect("should exist");
@@ -365,6 +376,8 @@ impl CreateOptions {
             level_count: 7, // Levels are currently hard coded to 7
 
             manual_journal_persist,
+
+            sync_on_commit,
 
             max_memtable_size,
 
@@ -455,6 +468,10 @@ impl CreateOptions {
             {
                 let key = encode_config_key(keyspace_id, "manual_journal_persist");
                 (key, [u8::from(self.manual_journal_persist)].into())
+            },
+            {
+                let key = encode_config_key(keyspace_id, "sync_on_commit");
+                (key, [u8::from(self.sync_on_commit)].into())
             },
             {
                 let key = encode_config_key(keyspace_id, "max_memtable_size");
@@ -652,6 +669,27 @@ impl CreateOptions {
     #[must_use]
     pub fn manual_journal_persist(mut self, flag: bool) -> Self {
         self.manual_journal_persist = flag;
+        self
+    }
+
+    /// If `true`, writes only return after their journal entries have been
+    /// durably persisted to disk (fsync), so acknowledged writes survive an
+    /// OS crash or power loss.
+    ///
+    /// Concurrent commits are grouped into a single fsync (group commit), so
+    /// the sync cost is amortized across writers instead of syncing every
+    /// individual write.
+    ///
+    /// Default = false
+    ///
+    /// # Note
+    ///
+    /// This also applies when `manual_journal_persist` is enabled: the
+    /// per-write flush to the OS stays manual, but commits still wait for
+    /// the group commit sync before returning.
+    #[must_use]
+    pub fn sync_on_commit(mut self, flag: bool) -> Self {
+        self.sync_on_commit = flag;
         self
     }
 

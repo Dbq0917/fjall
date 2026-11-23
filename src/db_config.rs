@@ -38,6 +38,10 @@ pub struct Config {
 
     pub(crate) manual_journal_persist: bool,
 
+    /// When `true`, commits only return after the journal entry has been
+    /// durably persisted to disk (group commit).
+    pub(crate) sync_on_commit: bool,
+
     /// Disables write stalls & halts (for deterministic testing, without background workers)
     #[doc(hidden)]
     pub(crate) disable_write_stalls: bool,
@@ -82,6 +86,7 @@ impl Config {
             worker_threads,
             // journal_recovery_mode: RecoveryMode::default(),
             manual_journal_persist: false,
+            sync_on_commit: false,
             disable_write_stalls: false,
 
             #[cfg(not(feature = "lz4"))]

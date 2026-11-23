@@ -16,17 +16,31 @@ mod test;
 use self::writer::PersistMode;
 use crate::file::fsync_directory;
 use batch_reader::JournalBatchReader;
-use lsm_tree::CompressionType;
+use lsm_tree::{CompressionType, SeqNo};
 use reader::JournalReader;
 use recovery::{recover_journals, RecoveryResult};
 use std::{
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
 };
 use writer::Writer;
 
 pub struct Journal {
     writer: Mutex<Writer>,
+
+    /// Next seqno that is not known to be durably persisted yet
+    /// (= highest fsynced seqno + 1).
+    ///
+    /// Shared with the active writer, so journal rotations and direct
+    /// `persist(SyncAll/SyncData)` calls advance the watermark as well.
+    durable_seqno: Arc<AtomicU64>,
+
+    /// Serializes group commit syncs, so concurrent committers are covered
+    /// by a single fsync.
+    sync_lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for Journal {
@@ -69,8 +83,12 @@ impl Journal {
     }
 
     fn from_file<P: AsRef<Path>>(path: P) -> crate::Result<Self> {
+        let durable_seqno = Arc::new(AtomicU64::new(0));
+
         Ok(Self {
-            writer: Mutex::new(Writer::from_file(path)?),
+            writer: Mutex::new(Writer::from_file(path, durable_seqno.clone())?),
+            durable_seqno,
+            sync_lock: Mutex::new(()),
         })
     }
 
@@ -87,7 +105,9 @@ impl Journal {
             );
         })?;
 
-        let writer = Writer::create_new(path)?;
+        let durable_seqno = Arc::new(AtomicU64::new(0));
+
+        let writer = Writer::create_new(path, durable_seqno.clone())?;
 
         // IMPORTANT: fsync folder on Unix
         fsync_directory(folder)?;
@@ -97,6 +117,8 @@ impl Journal {
 
         Ok(Self {
             writer: Mutex::new(writer),
+            durable_seqno,
+            sync_lock: Mutex::new(()),
         })
     }
 
@@ -122,6 +144,61 @@ impl Journal {
     pub fn persist(&self, mode: PersistMode) -> crate::Result<()> {
         let mut journal_writer = self.get_writer()?;
         journal_writer.persist(mode).map_err(Into::into)
+    }
+
+    /// Returns the next seqno that is not known to be durably persisted yet.
+    #[doc(hidden)]
+    pub fn durable_seqno(&self) -> SeqNo {
+        self.durable_seqno.load(Ordering::Acquire)
+    }
+
+    /// Blocks until all journal writes up to (and including) `seqno` are
+    /// durably persisted to disk.
+    ///
+    /// Concurrent callers are grouped into a single fsync (group commit):
+    /// while one caller syncs, other callers' writes pile up in the journal
+    /// buffer, and are then covered by the next sync, so the fsync rate is
+    /// bounded by the fsync latency, not by the number of commits.
+    ///
+    /// IMPORTANT: Must not be called while holding the journal writer lock.
+    pub(crate) fn sync_up_to(&self, seqno: SeqNo) -> crate::Result<()> {
+        // Fast path: already durable
+        if self.durable_seqno() > seqno {
+            return Ok(());
+        }
+
+        let _sync_guard = self.sync_lock.lock().map_err(|_| crate::Error::Poisoned)?;
+
+        // Another thread may have synced our write while we were waiting
+        if self.durable_seqno() > seqno {
+            return Ok(());
+        }
+
+        // Flush the journal buffer and get a dedicated sync handle, so the
+        // (potentially slow) fsync below does not block other writers
+        let (sync_file, covered_seqno) = {
+            let mut journal_writer = self.get_writer()?;
+
+            journal_writer.flush_buffer()?;
+
+            (journal_writer.sync_handle()?, journal_writer.last_seqno())
+        };
+
+        // NOTE: `covered_seqno` may be `None` if the journal was rotated in
+        // between - rotation fsyncs the previous journal, so our write is
+        // durable either way
+        debug_assert!(covered_seqno.is_none_or(|covered| covered >= seqno));
+
+        sync_file.sync_data().inspect_err(|e| {
+            log::error!("Failed to fsyncdata journal file: {e:?}");
+        })?;
+
+        if let Some(covered_seqno) = covered_seqno {
+            self.durable_seqno
+                .fetch_max(covered_seqno + 1, Ordering::AcqRel);
+        }
+
+        Ok(())
     }
 
     pub fn recover<P: AsRef<Path>>(

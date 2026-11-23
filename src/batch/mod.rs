@@ -169,6 +169,21 @@ impl WriteBatch {
 
         drop(keyspaces);
 
+        // IMPORTANT: The journal writer lock must be released before syncing,
+        // so other writers can keep appending while the fsync is in flight
+        if self.db.config.sync_on_commit {
+            self.db
+                .supervisor
+                .journal
+                .sync_up_to(batch_seqno)
+                .inspect_err(|e| {
+                    log::error!(
+                        "persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}",
+                    );
+                    self.db.is_poisoned.poison();
+                })?;
+        }
+
         // IMPORTANT: Add batch size to current write buffer size
         // Otherwise write buffer growth is unbounded when using batches
         self.db.supervisor.write_buffer_size.allocate(batch_size);

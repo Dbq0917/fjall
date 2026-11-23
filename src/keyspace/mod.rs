@@ -268,6 +268,20 @@ impl Keyspace {
 
         self.supervisor.snapshot_tracker.publish(seqno);
 
+        drop(journal_writer);
+
+        // IMPORTANT: The journal writer lock must be released before syncing,
+        // so other writers can keep appending while the fsync is in flight
+        if self.config.sync_on_commit {
+            self.supervisor
+                .journal
+                .sync_up_to(seqno)
+                .inspect_err(|e| {
+                    log::error!("persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}");
+                    self.is_poisoned.poison();
+                })?;
+        }
+
         Ok(())
     }
 
@@ -1018,6 +1032,18 @@ impl Keyspace {
 
         drop(journal_writer);
 
+        // IMPORTANT: The journal writer lock must be released before syncing,
+        // so other writers can keep appending while the fsync is in flight
+        if self.config.sync_on_commit {
+            self.supervisor
+                .journal
+                .sync_up_to(seqno)
+                .inspect_err(|e| {
+                    log::error!("persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}");
+                    self.is_poisoned.poison();
+                })?;
+        }
+
         self.supervisor.write_buffer_size.allocate(item_size);
         self.maintenance(memtable_size);
 
@@ -1091,6 +1117,18 @@ impl Keyspace {
         self.supervisor.snapshot_tracker.publish(seqno);
 
         drop(journal_writer);
+
+        // IMPORTANT: The journal writer lock must be released before syncing,
+        // so other writers can keep appending while the fsync is in flight
+        if self.config.sync_on_commit {
+            self.supervisor
+                .journal
+                .sync_up_to(seqno)
+                .inspect_err(|e| {
+                    log::error!("persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}");
+                    self.is_poisoned.poison();
+                })?;
+        }
 
         self.supervisor.write_buffer_size.allocate(item_size);
         self.maintenance(memtable_size);
@@ -1185,6 +1223,18 @@ impl Keyspace {
         self.supervisor.snapshot_tracker.publish(seqno);
 
         drop(journal_writer);
+
+        // IMPORTANT: The journal writer lock must be released before syncing,
+        // so other writers can keep appending while the fsync is in flight
+        if self.config.sync_on_commit {
+            self.supervisor
+                .journal
+                .sync_up_to(seqno)
+                .inspect_err(|e| {
+                    log::error!("persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}");
+                    self.is_poisoned.poison();
+                })?;
+        }
 
         self.supervisor.write_buffer_size.allocate(item_size);
         self.maintenance(memtable_size);
