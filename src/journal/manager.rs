@@ -2,7 +2,7 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use super::writer::Writer;
+use super::writer::{DeferredSync, Writer};
 use crate::Keyspace;
 use lsm_tree::{AbstractTree, SeqNo};
 use std::{path::PathBuf, sync::MutexGuard};
@@ -170,10 +170,10 @@ impl JournalManager {
         &mut self,
         journal_writer: &mut MutexGuard<Writer>,
         watermarks: Vec<EvictionWatermark>,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<DeferredSync> {
         let journal_size = journal_writer.len()?;
 
-        let (sealed_path, _) = journal_writer.rotate()?;
+        let (sync, sealed_path, _) = journal_writer.start_rotation()?;
 
         self.enqueue(Item {
             path: sealed_path,
@@ -181,6 +181,6 @@ impl JournalManager {
             size_in_bytes: journal_size,
         });
 
-        Ok(())
+        Ok(sync)
     }
 }

@@ -187,7 +187,7 @@ fn worker_tick(ctx: &WorkerState) -> crate::Result<bool> {
                 return Ok(false);
             };
 
-            {
+            let (sync, stragglers) = {
                 log::trace!("acquiring journal lock to maybe rotate journal");
                 let mut journal_writer = ctx.supervisor.journal.get_writer()?;
 
@@ -206,26 +206,30 @@ fn worker_tick(ctx: &WorkerState) -> crate::Result<bool> {
                         ctx.supervisor.build_seqno_map(&keyspaces)
                     };
 
-                    journal_manager.rotate_journal(&mut journal_writer, seqno_map)?;
+                    let sync = journal_manager.rotate_journal(&mut journal_writer, seqno_map)?;
 
-                    if journal_manager.disk_space_used()
+                    let stragglers = if journal_manager.disk_space_used()
                         >= ctx.supervisor.db_config.max_journaling_size_in_bytes
                     {
-                        let stragglers =
-                            journal_manager.get_keyspaces_to_flush_for_oldest_journal_eviction();
+                        journal_manager.get_keyspaces_to_flush_for_oldest_journal_eviction()
+                    } else {
+                        Vec::new()
+                    };
 
-                        for keyspace in stragglers {
-                            log::info!(
-                                "Rotating {:?} to try to reduce journal size",
-                                keyspace.name,
-                            );
-                            keyspace.request_rotation();
-                        }
-                    }
+                    (sync, stragglers)
                 } else {
                     // https://github.com/fjall-rs/fjall/issues/329
-                    journal_writer.persist(crate::PersistMode::SyncAll)?;
+                    (journal_writer.start_sync()?, Vec::new())
                 }
+            };
+
+            // Fsync outside the journal lock so buffered writers can keep appending.
+            // The barrier chain preserves ordering with older journals and later flushes.
+            sync.persist()?;
+
+            for keyspace in stragglers {
+                log::info!("Rotating {:?} to try to reduce journal size", keyspace.name);
+                keyspace.request_rotation();
             }
 
             run_flush(

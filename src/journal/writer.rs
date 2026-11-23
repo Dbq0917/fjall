@@ -13,6 +13,10 @@ use std::{
     hash::Hasher,
     io::{BufWriter, Seek, Write},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 // TODO: this should be a database configuration
@@ -20,11 +24,79 @@ pub const PRE_ALLOCATED_BYTES: u64 = 64 * 1_024 * 1_024;
 
 pub const JOURNAL_BUFFER_BYTES: usize = 8 * 1_024;
 
+struct DeferredSyncState {
+    file: File,
+    folder: Option<PathBuf>,
+}
+
+struct DeferredSyncInner {
+    state: Mutex<Option<DeferredSyncState>>,
+    previous: Option<DeferredSync>,
+    completed: AtomicBool,
+}
+
+/// A journal durability barrier that can be completed after the journal lock is released.
+///
+/// Barriers form a chain in the order they were captured. Completing a newer barrier
+/// first also completes every older barrier, so table registration can never overtake
+/// the fsync of an older journal.
+#[derive(Clone)]
+pub struct DeferredSync(Arc<DeferredSyncInner>);
+
+impl DeferredSync {
+    fn new(previous: Option<Self>, file: File, folder: Option<PathBuf>) -> Self {
+        Self(Arc::new(DeferredSyncInner {
+            state: Mutex::new(Some(DeferredSyncState { file, folder })),
+            previous,
+            completed: AtomicBool::new(false),
+        }))
+    }
+
+    fn is_completed(&self) -> bool {
+        self.0.completed.load(Ordering::Acquire)
+    }
+
+    /// Completes this barrier and all older barriers in the chain.
+    pub(crate) fn persist(&self) -> std::io::Result<()> {
+        if self.is_completed() {
+            return Ok(());
+        }
+
+        #[expect(clippy::expect_used)]
+        let mut state = self.0.state.lock().expect("lock is poisoned");
+
+        if let Some(previous) = &self.0.previous {
+            previous.persist()?;
+        }
+
+        let Some(resources) = state.as_ref() else {
+            self.0.completed.store(true, Ordering::Release);
+            return Ok(());
+        };
+
+        resources
+            .file
+            .sync_all()
+            .inspect_err(|e| log::error!("Failed to fsync deferred journal data: {e:?}"))?;
+
+        if let Some(folder) = &resources.folder {
+            fsync_directory(folder)?;
+        }
+
+        state.take();
+        self.0.completed.store(true, Ordering::Release);
+
+        Ok(())
+    }
+}
+
 pub struct Writer {
     pub(crate) path: PathBuf,
     file: BufWriter<File>,
     buf: Vec<u8>,
     is_buffer_dirty: bool,
+
+    deferred_sync: Option<DeferredSync>,
 
     compression: CompressionType,
     compression_threshold: usize,
@@ -63,8 +135,29 @@ impl Writer {
         Ok(self.file.get_ref().metadata()?.len())
     }
 
-    pub fn rotate(&mut self) -> crate::Result<(PathBuf, PathBuf)> {
-        self.persist(PersistMode::SyncAll)?;
+    /// Captures a durability barrier for everything written so far.
+    ///
+    /// The caller must complete the returned barrier after releasing the journal lock.
+    pub(crate) fn start_sync(&mut self) -> crate::Result<DeferredSync> {
+        self.persist(PersistMode::Buffer)?;
+        let file = self.file.get_ref().try_clone()?;
+
+        let previous = self
+            .deferred_sync
+            .take()
+            .filter(|sync| !sync.is_completed());
+        let sync = DeferredSync::new(previous, file, None);
+        self.deferred_sync = Some(sync.clone());
+
+        Ok(sync)
+    }
+
+    /// Starts a journal rotation without fsyncing the sealed journal under the write lock.
+    ///
+    /// The returned barrier must be completed after the journal lock is released. The new
+    /// active writer also retains the barrier so later syncs cannot overtake it.
+    pub(crate) fn start_rotation(&mut self) -> crate::Result<(DeferredSync, PathBuf, PathBuf)> {
+        self.persist(PersistMode::Buffer)?;
 
         log::debug!(
             "Sealing active journal at {}, len={}B",
@@ -79,8 +172,6 @@ impl Writer {
                 })?
                 .len(),
         );
-
-        let prev_path = self.path.clone();
 
         let folder = self
             .path
@@ -110,15 +201,32 @@ impl Writer {
         let new_path = folder.join(format!("{}.jnl", journal_id + 1));
         log::debug!("Rotating active journal to {}", new_path.display());
 
-        let comp = self.compression;
-        let compt = self.compression_threshold;
-        *self = Self::create_new(new_path.clone())?;
-        self.set_compression(comp, compt);
+        let previous = self
+            .deferred_sync
+            .clone()
+            .filter(|sync| !sync.is_completed());
+        let sealed_file = self.file.get_ref().try_clone()?;
+        let sealed_path = self.path.clone();
 
-        // IMPORTANT: fsync folder on Unix
-        fsync_directory(&folder)?;
+        let old_journal = {
+            let mut new_journal = Self::create_new(new_path.clone())?;
+            new_journal.set_compression(self.compression, self.compression_threshold);
+            std::mem::replace(self, new_journal)
+        };
 
-        Ok((prev_path, new_path))
+        let sync = DeferredSync::new(previous, sealed_file, Some(folder));
+        self.deferred_sync = Some(sync.clone());
+
+        drop(old_journal);
+
+        Ok((sync, sealed_path, new_path))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rotate(&mut self) -> crate::Result<(PathBuf, PathBuf)> {
+        let (sync, sealed_path, new_path) = self.start_rotation()?;
+        sync.persist()?;
+        Ok((sealed_path, new_path))
     }
 
     pub fn create_new<P: Into<PathBuf>>(path: P) -> crate::Result<Self> {
@@ -135,15 +243,14 @@ impl Writer {
             );
         })?;
 
-        file.sync_all().inspect_err(|e| {
-            log::error!("Failed to fsync journal file at {}: {e:?}", path.display());
-        })?;
-
+        // The empty file has no acknowledged writes yet. Rotation persists its directory
+        // entry outside the journal lock, and later Sync* calls persist its contents.
         Ok(Self {
             path,
             file: BufWriter::new(file),
             buf: Vec::new(),
             is_buffer_dirty: false,
+            deferred_sync: None,
             compression: CompressionType::None,
             compression_threshold: 0,
         })
@@ -168,15 +275,13 @@ impl Writer {
                 );
             })?;
 
-            file.sync_all().inspect_err(|e| {
-                log::error!("Failed to fsync journal file at {}: {e:?}", path.display());
-            })?;
-
+            // See `create_new`: there are no acknowledged writes to persist yet.
             return Ok(Self {
                 path: path.into(),
                 file: BufWriter::with_capacity(JOURNAL_BUFFER_BYTES, file),
                 buf: Vec::new(),
                 is_buffer_dirty: false,
+                deferred_sync: None,
                 compression: CompressionType::None,
                 compression_threshold: 0,
             });
@@ -194,6 +299,7 @@ impl Writer {
             file: BufWriter::with_capacity(JOURNAL_BUFFER_BYTES, file),
             buf: Vec::new(),
             is_buffer_dirty: false,
+            deferred_sync: None,
             compression: CompressionType::None,
             compression_threshold: 0,
         })
@@ -214,6 +320,13 @@ impl Writer {
                 );
             })?;
             self.is_buffer_dirty = false;
+        }
+
+        if matches!(mode, PersistMode::SyncData | PersistMode::SyncAll) {
+            if let Some(sync) = self.deferred_sync.clone() {
+                sync.persist()?;
+                self.deferred_sync = None;
+            }
         }
 
         match mode {
@@ -376,5 +489,54 @@ impl Writer {
         byte_count += self.write_end(checksum)?;
 
         Ok(byte_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_item(writer: &mut Writer, seqno: SeqNo) -> crate::Result<()> {
+        writer.write_raw(0, b"key", b"value", ValueType::Value, seqno)?;
+        Ok(())
+    }
+
+    #[test]
+    fn newer_deferred_sync_completes_older_barriers() -> crate::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let mut writer = Writer::create_new(folder.path().join("0.jnl"))?;
+
+        write_item(&mut writer, 0)?;
+        let first = writer.start_sync()?;
+
+        write_item(&mut writer, 1)?;
+        let second = writer.start_sync()?;
+
+        assert!(!first.is_completed());
+        assert!(!second.is_completed());
+
+        second.persist()?;
+
+        assert!(first.is_completed());
+        assert!(second.is_completed());
+
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_sync_completes_deferred_rotation() -> crate::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let mut writer = Writer::create_new(folder.path().join("0.jnl"))?;
+
+        write_item(&mut writer, 0)?;
+        let (rotation_sync, _, _) = writer.start_rotation()?;
+
+        assert!(!rotation_sync.is_completed());
+
+        writer.persist(PersistMode::SyncAll)?;
+
+        assert!(rotation_sync.is_completed());
+
+        Ok(())
     }
 }
