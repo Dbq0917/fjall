@@ -424,7 +424,7 @@ impl Keyspace {
     pub fn iter(&self) -> Iter {
         let nonce = self.supervisor.snapshot_tracker.open();
         let iter = self.tree.iter(nonce.instant, None);
-        crate::iter::Iter::new(nonce, iter)
+        crate::iter::Iter::new(&self.tree, nonce, iter)
     }
 
     /// Returns an iterator over a range of items.
@@ -448,8 +448,8 @@ impl Keyspace {
     /// ```
     pub fn range<K: AsRef<[u8]>, R: RangeBounds<K>>(&self, range: R) -> Iter {
         let nonce = self.supervisor.snapshot_tracker.open();
-        let iter = self.tree.range(range, SeqNo::MAX, None);
-        crate::iter::Iter::new(nonce, iter)
+        let iter = self.tree.range(range, nonce.instant, None);
+        crate::iter::Iter::new(&self.tree, nonce, iter)
     }
 
     /// Returns an iterator over a prefixed set of items.
@@ -473,8 +473,8 @@ impl Keyspace {
     /// ```
     pub fn prefix<K: AsRef<[u8]>>(&self, prefix: K) -> Iter {
         let nonce = self.supervisor.snapshot_tracker.open();
-        let iter = self.tree.prefix(prefix, SeqNo::MAX, None);
-        crate::iter::Iter::new(nonce, iter)
+        let iter = self.tree.prefix(prefix, nonce.instant, None);
+        crate::iter::Iter::new(&self.tree, nonce, iter)
     }
 
     /// Approximates the number of items in the keyspace.

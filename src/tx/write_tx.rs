@@ -119,7 +119,7 @@ impl Readable for BaseTransaction {
                 .map(|mt| (mt, self.seqno)),
         );
 
-        Iter::new(self.nonce.clone(), iter)
+        Iter::new(&keyspace.tree, self.nonce.clone(), iter)
     }
 
     fn range<K: AsRef<[u8]>, R: RangeBounds<K>>(
@@ -138,7 +138,7 @@ impl Readable for BaseTransaction {
                 .map(|mt| (mt, self.seqno)),
         );
 
-        Iter::new(self.nonce.clone(), iter)
+        Iter::new(&keyspace.tree, self.nonce.clone(), iter)
     }
 
     fn prefix<K: AsRef<[u8]>>(&self, keyspace: impl AsRef<Keyspace>, prefix: K) -> Iter {
@@ -153,7 +153,7 @@ impl Readable for BaseTransaction {
                 .map(|mt| (mt, self.seqno)),
         );
 
-        Iter::new(self.nonce.clone(), iter)
+        Iter::new(&keyspace.tree, self.nonce.clone(), iter)
     }
 }
 

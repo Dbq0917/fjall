@@ -76,9 +76,10 @@ impl Readable for Snapshot {
     }
 
     fn iter(&self, keyspace: impl AsRef<Keyspace>) -> Iter {
-        let iter = keyspace.as_ref().tree.iter(self.nonce.instant, None);
+        let tree = &keyspace.as_ref().tree;
+        let iter = tree.iter(self.nonce.instant, None);
 
-        Iter::new(self.nonce.clone(), iter)
+        Iter::new(tree, self.nonce.clone(), iter)
     }
 
     fn range<K: AsRef<[u8]>, R: RangeBounds<K>>(
@@ -86,20 +87,16 @@ impl Readable for Snapshot {
         keyspace: impl AsRef<Keyspace>,
         range: R,
     ) -> Iter {
-        let iter = keyspace
-            .as_ref()
-            .tree
-            .range(range, self.nonce.instant, None);
+        let tree = &keyspace.as_ref().tree;
+        let iter = tree.range(range, self.nonce.instant, None);
 
-        Iter::new(self.nonce.clone(), iter)
+        Iter::new(tree, self.nonce.clone(), iter)
     }
 
     fn prefix<K: AsRef<[u8]>>(&self, keyspace: impl AsRef<Keyspace>, prefix: K) -> Iter {
-        let iter = keyspace
-            .as_ref()
-            .tree
-            .prefix(prefix, self.nonce.instant, None);
+        let tree = &keyspace.as_ref().tree;
+        let iter = tree.prefix(prefix, self.nonce.instant, None);
 
-        Iter::new(self.nonce.clone(), iter)
+        Iter::new(tree, self.nonce.clone(), iter)
     }
 }
